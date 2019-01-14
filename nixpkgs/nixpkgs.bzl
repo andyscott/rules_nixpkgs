@@ -56,112 +56,25 @@ nixpkgs_local_repository = repository_rule(
     },
 )
 
-def _nixpkgs_package_impl(repository_ctx):
-    repositories = repository_ctx.attr.repositories
-
-    if repository_ctx.attr.build_file and repository_ctx.attr.build_file_content:
-        fail("Specify one of 'build_file' or 'build_file_content', but not both.")
-    elif repository_ctx.attr.build_file:
-        repository_ctx.symlink(repository_ctx.attr.build_file, "BUILD")
-    elif repository_ctx.attr.build_file_content:
-        repository_ctx.file("BUILD", content = repository_ctx.attr.build_file_content)
-    else:
-        repository_ctx.template("BUILD", Label("@io_tweag_rules_nixpkgs//nixpkgs:BUILD.pkg"))
-
-    strFailureImplicitNixpkgs = (
-        "One of 'repositories', 'nix_file' or 'nix_file_content' must be provided. " +
-        "The NIX_PATH environment variable is not inherited."
-    )
-
-    expr_args = []
-    if repository_ctx.attr.nix_file and repository_ctx.attr.nix_file_content:
-        fail("Specify one of 'nix_file' or 'nix_file_content', but not both.")
-    elif repository_ctx.attr.nix_file:
-        repository_ctx.symlink(repository_ctx.attr.nix_file, "default.nix")
-    elif repository_ctx.attr.nix_file_content:
-        expr_args = ["-E", repository_ctx.attr.nix_file_content]
-    elif not repositories:
-        fail(strFailureImplicitNixpkgs)
-    else:
-        expr_args = ["-E", "import <nixpkgs> {}"]
-
-    _symlink_nix_file_deps(repository_ctx, repository_ctx.attr.nix_file_deps)
-
-    expr_args.extend([
-        "-A",
-        repository_ctx.attr.attribute_path if repository_ctx.attr.nix_file or repository_ctx.attr.nix_file_content else repository_ctx.attr.attribute_path or repository_ctx.attr.name,
-        # Creating an out link prevents nix from garbage collecting the store path.
-        # nixpkgs uses `nix-support/` for such house-keeping files, so we mirror them
-        # and use `bazel-support/`, under the assumption that no nix package has
-        # a file named `bazel-support` in its root.
-        # A `bazel clean` deletes the symlink and thus nix is free to garbage collect
-        # the store path.
-        "--out-link",
-        "bazel-support/nix-out-link",
-    ])
-
-    expr_args.extend(repository_ctx.attr.nixopts)
-
-    # If repositories is not set, leave empty so nix will fail
-    # unless a pinned nixpkgs is set in the `nix_file` attribute.
-    nix_path = ""
-    if repositories:
-        nix_path = ":".join(
-            [
-                (path_name + "=" + str(repository_ctx.path(target)))
-                for (target, path_name) in repositories.items()
-            ],
-        )
-    elif not (repository_ctx.attr.nix_file or repository_ctx.attr.nix_file_content):
-        fail(strFailureImplicitNixpkgs)
-
-    nix_build_path = _executable_path(
-        repository_ctx,
-        "nix-build",
-        extra_msg = "See: https://nixos.org/nix/",
-    )
-    nix_build = [nix_build_path] + expr_args
-
-    # Large enough integer that Bazel can still parse. We don't have
-    # access to MAX_INT and 0 is not a valid timeout so this is as good
-    # as we can do.
-    timeout = 1073741824
-
-    exec_result = _execute_or_fail(
-        repository_ctx,
-        nix_build,
-        failure_message = "Cannot build Nix attribute '{}'.".format(
-            repository_ctx.attr.attribute_path,
-        ),
-        quiet = False,
-        timeout = timeout,
-        environment = dict(NIX_PATH = nix_path),
-    )
-    output_path = exec_result.stdout.splitlines()[-1]
-
-    # Build a forest of symlinks (like new_local_package() does) to the
-    # Nix store.
-    for target in _find_children(repository_ctx, output_path):
-        basename = target.rpartition("/")[-1]
-        repository_ctx.symlink(target, basename)
-
-_nixpkgs_package = repository_rule(
-    implementation = _nixpkgs_package_impl,
-    attrs = {
-        "attribute_path": attr.string(),
-        "nix_file": attr.label(allow_single_file = [".nix"]),
-        "nix_file_deps": attr.label_list(),
-        "nix_file_content": attr.string(),
-        "repositories": attr.label_keyed_string_dict(),
-        "repository": attr.label(),
-        "build_file": attr.label(),
-        "build_file_content": attr.string(),
-        "nixopts": attr.string_list(),
-    },
-)
-
-def nixpkgs_package(*args, **kwargs):
-    invert_repositories(_nixpkgs_package, *args, **kwargs)
+def nixpkgs_package(
+    name,
+    repositories = None,
+    repository = None,
+    nixopts = [],
+    **kwargs
+    ):
+  nixpkgs_packages(
+      name = name + "__drvfile",
+      repository = repository,
+      repositories = repositories,
+      nixopts = nixopts,
+      packages = {
+          name: dict(
+              nixops = nixopts,
+              **kwargs
+            ),
+          }
+  )
 
 def invert_dict(dict):
     """Swap the keys and values of a dict − assuming that all values are
@@ -358,6 +271,15 @@ nixpkgs_package_realize = repository_rule(
     },
 )
 
+def hasAttr (item, attrName):
+    """
+    Checks whether the given item is a record with the given field set to
+    non-None
+    """
+    return type(item) == type({}) and \
+        attrName in item and \
+        item[attrName] != None
+
 def nixpkgs_packages(
     name,
     packages,
@@ -372,7 +294,7 @@ def nixpkgs_packages(
     desugared_packages = {}
     for (packageName, value) in packages.items():
         if type(value) == type(""):
-            desugared_packages[packageName] = { "nix_attribute_path": value }
+            desugared_packages[packageName] = { "attribute_path": value }
         else:
             desugared_packages[packageName] = value
 
@@ -385,12 +307,16 @@ def nixpkgs_packages(
     packagesFromFile = {}
     packagesFromExpr = {}
     for (packageName, value) in desugared_packages.items():
-        if type(value) == type({}) and "nix_attribute_path" in value:
-          packagesFromAttr[packageName] = value["nix_attribute_path"]
-        elif type(value) == type({}) and "nix_file" in value:
+        # if type(value) == type({}) and "nix_file" in value:
+        if hasAttr(value, "nix_file"):
           packagesFromFile[packageName] = value["nix_file"]
         elif type(value) == type({}) and "nix_file_content" in value:
           packagesFromExpr[packageName] = value["nix_file_content"]
+        elif type(value) == type({}) and "attribute_path" in value:
+          packagesFromAttr[packageName] = value["attribute_path"]
+        elif type(value) == type({}):
+          # Default case: ``attribute_path`` is implicitely equal to ``packageName``
+          packagesFromAttr[packageName] = packageName
 
     # Instantiate the package set (*i.e* evaluate the nix expressions, but
     # without building anything)
